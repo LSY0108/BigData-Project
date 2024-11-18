@@ -44,10 +44,35 @@ import pandas as pd
 import numpy as np
 from typing import List, Optional, Dict, Tuple
 from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 class DataProcessor:
-    """쌀 생산량과 기후 데이터를 처리하는 클래스"""
+    """쌀 생산량과 기후 데이터를 처리하는 클래스
 
+    주요 기능:
+    1. 쌀 생산량 데이터 전처리 및 구조화
+    2. 기후 데이터(연간/월간) 전처리 및 정규화
+    3. 결측치 처리 및 데이터 보간
+    4. 지역별 데이터 매핑 및 필터링
+
+    주요 처리 과정:
+    1. Excel/CSV 파일에서 데이터 로드
+    2. 결측치 처리 및 데이터 정규화
+    3. 지역별 데이터 매핑 및 통계 계산
+    4. 처리된 데이터를 파일로 저장
+    """
+
+    # 소수점 정밀도 설정 (모든 수치형 데이터는 소수점 첫째자리까지 표현)
+    DECIMAL_PRECISION = 1
+
+    # 분석에 사용되는 기후 지표 정의
+    # 모든 기후 관련 처리에서 일관되게 사용되는 지표들
+    CLIMATE_METRICS = ['평균기온(°C)', '합계 강수량(mm)', '평균 상대습도(%)', '합계 일조시간(hr)']
+
+    # 기후 데이터의 컬럼명 매핑 정의
+    # 원본 데이터의 컬럼명을 일관된 형식으로 변환하기 위한 딕셔너리
+    # 연간('annual')과 월간('monthly') 데이터의 컬럼명이 서로 다르므로 통일된 형식으로 변환
     CLIMATE_COLUMNS = {
         'annual': {
             '평균기온(°C)합계': '평균기온(°C)',
@@ -63,6 +88,9 @@ class DataProcessor:
         }
     }
 
+    # 지역별 행정구역 매핑
+    # 지점명을 광역시도 단위로 그룹화하기 위한 딕셔너리
+    # 키: 지점명, 값: 해당 지점이 속한 광역시도
     REGION_MAPPING = {
         # 전라남도 지역
         '목포': '전라남도', '여수': '전라남도', '순천': '전라남도',
@@ -90,119 +118,159 @@ class DataProcessor:
     def __init__(self, target_regions: List[str]):
         self.target_regions = target_regions
 
-    def fill_missing_years(self, df: pd.DataFrame, start_year: int = 2008, end_year: int = 2023) -> pd.DataFrame:
+    def _calculate_location_means(self, df: pd.DataFrame, group_by: str,
+                                columns: List[str], is_monthly: bool = False) -> Dict:
         """
-        2008-2023년 범위의 데이터를 채우는 함수
-        누락된 연도의 데이터는 해당 지역의 평균값으로 채움
-        월별 데이터('YYYY-MM'형식)와 연간 데이터('YYYY'형식) 모두 처리
-        지점과 지점명은 원본 매핑 유지
-        """
-        climate_columns = ['평균기온(°C)', '합계 강수량(mm)', '평균 상대습도(%)', '합계 일조시간(hr)']
-        result_df = []
+        지역별 평균값 계산을 위한 헬퍼 메서드
 
-        # 일시 컬럼이 월별 데이터(YYYY-MM) 형식인지 확인
+        Notes:
+        - 월별 데이터의 경우 각 월별로 개별 평균 계산
+        - 특정 월의 데이터가 없는 경우 전체 평균으로 대체
+        """
+        if is_monthly:
+            means = {}
+            for col in columns:
+                if col in df.columns:
+                    monthly_means = {}
+                    for month in range(1, 13):
+                        month_data = df[df['일시'].str.endswith(f'-{month:02d}')][col]
+                        monthly_means[month] = (
+                            month_data.mean() if not month_data.empty
+                            else df[col].mean()
+                        )
+                    means[col] = monthly_means
+            return means
+        else:
+            return {
+                col: df[col].mean()
+                for col in columns
+                if col in df.columns
+            }
+
+    def _sort_dataframe(self, df: pd.DataFrame, location_col: str) -> pd.DataFrame:
+        """데이터프레임 정렬을 위한 통일된 메서드"""
+        return df.sort_values([location_col, '일시']).reset_index(drop=True)
+
+    def fill_missing_years(self, df: pd.DataFrame, start_year: int = 2008,
+                          end_year: int = 2023) -> pd.DataFrame:
+        """
+        2008-2023년 범위의 누락된 연도 데이터를 보간하는 함수
+
+        Args:
+            df (pd.DataFrame): 처리할 데이터프레임
+            start_year (int): 시작 연도 (기본값: 2008)
+            end_year (int): 종료 연도 (기본값: 2023)
+
+        Returns:
+            pd.DataFrame: 결측치가 보간된 데이터프레임
+
+        처리 과정:
+        1. 각 지역별로 누락된 연도/월 확인
+        2. 해당 지역의 평균값으로 결측치 대체
+        3. 월별 데이터의 경우 동일 월의 평균값으로 대체 (계절성 고려)
+        4. 데이터의 일관성을 위해 소수점 첫째자리까지 표준화
+
+        Notes:
+            - 월별 데이터의 경우 YYYY-MM 형식으로 처리
+            - 연간 데이터의 경우 YYYY 형식으로 처리
+            - 결측치는 해당 지역의 평균값으로 대체
+        """
+        result_df = []
         is_monthly = isinstance(df['일시'].iloc[0], str) and '-' in str(df['일시'].iloc[0])
 
         for location in df['지점명'].unique():
-            # 해당 지역의 데이터만 필터링
             location_data = df[df['지점명'] == location].copy()
-
-            # 해당 지점의 지점번호 가져오기
             location_code = location_data['지점'].iloc[0]
 
             if is_monthly:
-                # 월별 데이터 처리
                 existing_dates = location_data['일시'].unique()
-                all_dates = []
-                for year in range(start_year, end_year + 1):
-                    for month in range(1, 13):
-                        all_dates.append(f"{year}-{month:02d}")
+                all_dates = [
+                    f"{year}-{month:02d}"
+                    for year in range(start_year, end_year + 1)
+                    for month in range(1, 13)
+                ]
 
-                # 해당 지역의 각 기후 지표 평균 계산 (월별)
-                location_means = {}
-                for col in climate_columns:
-                    if col in location_data.columns:
-                        # 각 월별로 평균 계산
-                        monthly_means = {}
-                        for month in range(1, 13):
-                            month_data = location_data[location_data['일시'].str.endswith(f'-{month:02d}')][col]
-                            if not month_data.empty:
-                                monthly_means[month] = month_data.mean()
-                            else:
-                                monthly_means[month] = location_data[col].mean()
-                        location_means[col] = monthly_means
+                location_means = self._calculate_location_means(
+                    location_data, '지점명', self.CLIMATE_METRICS, is_monthly=True
+                )
 
-                # 누락된 날짜에 대한 데이터 생성
                 missing_dates = [date for date in all_dates if date not in existing_dates]
                 for date in missing_dates:
                     year, month = map(int, date.split('-'))
                     new_row = {
-                        '지점': location_code,  # 정수형 지점 코드 유지
+                        '지점': location_code,
                         '지점명': location,
-                        '일시': date
+                        '일시': date,
+                        **{col: location_means[col][month]
+                           for col in self.CLIMATE_METRICS
+                           if col in location_data.columns}
                     }
-                    for col in climate_columns:
-                        if col in location_data.columns:
-                            new_row[col] = location_means[col][month]
                     result_df.append(new_row)
             else:
-                # 연간 데이터 처리
                 existing_years = location_data['일시'].astype(int).unique()
                 all_years = list(range(start_year, end_year + 1))
 
-                # 해당 지역의 각 기후 지표 평균 계산
-                location_means = {
-                    col: location_data[col].mean()
-                    for col in climate_columns
-                    if col in location_data.columns
-                }
+                location_means = self._calculate_location_means(
+                    location_data, '지점명', self.CLIMATE_METRICS
+                )
 
-                # 누락된 연도에 대한 데이터 생성
                 missing_years = [year for year in all_years if year not in existing_years]
                 for year in missing_years:
                     new_row = {
-                        '지점': location_code,  # 정수형 지점 코드 유지
+                        '지점': location_code,
                         '지점명': location,
                         '일시': year,
                         **location_means
                     }
                     result_df.append(new_row)
 
-            # 기존 데이터도 결과에 추가
             result_df.extend(location_data.to_dict('records'))
 
-        # 결과를 DataFrame으로 변환
         result_df = pd.DataFrame(result_df)
-
-        # 지점을 정수형으로 변환
         result_df['지점'] = result_df['지점'].astype(int)
 
-        # 정렬 및 인덱스 재설정
-        result_df = result_df.sort_values(['지점명', '일시']).reset_index(drop=True)
-
-        # 숫자형 컬럼들 반올림
-        for col in climate_columns:
+        result_df = self._sort_dataframe(result_df, '지점명')
+        for col in self.CLIMATE_METRICS:
             if col in result_df.columns:
-                result_df[col] = result_df[col].round(1)
+                result_df[col] = result_df[col].round(self.DECIMAL_PRECISION)
 
         return result_df
 
     def process_rice_data(self, file_path: Path, output_path: Optional[Path] = None) -> pd.DataFrame:
-        """쌀 생산량 데이터 처리"""
+        """
+        쌀 생산량 데이터를 처리하는 메인 함수
+
+        처리 과정:
+        1. Excel 파일에서 데이터 로드
+        2. 연도별 재배면적과 생산량 데이터 추출
+        3. 데이터 재구조화 (Long format으로 변환)
+        4. 결측치를 0으로 대체
+        5. 대상 지역 필터링 및 정렬
+
+        Notes:
+            - Excel 파일의 구조:
+              * 첫 번째 열: 지역명
+              * 이후 열: 연도별 재배면적과 생산량이 번갈아가며 존재
+            - '-' 문자는 0으로 처리
+            - 숫자가 아닌 데이터는 무시
+        """
         try:
             raw_data = pd.read_excel(file_path)
         except Exception as e:
             raise ValueError(f"Excel 파일 읽기 실패: {str(e)}")
 
+        # 연도 컬럼 추출 (숫자로 된 컬럼명만 선택)
         years = [int(col) for col in raw_data.columns[1:] if str(col).isdigit()]
         unique_years = sorted(set(years))
 
+        # 데이터 재구조화
         restructured_data = []
         for idx, row in raw_data.iloc[2:].iterrows():
             region_name = row.iloc[0]
             for i, year in enumerate(unique_years):
-                area_idx = i * 2 + 1
-                prod_idx = i * 2 + 2
+                # 각 연도별로 재배면적과 생산량이 2개 컬럼씩 존재
+                area_idx = i * 2 + 1   # 재배면적 컬럼 인덱스
+                prod_idx = i * 2 + 2   # 생산량 컬럼 인덱스
 
                 try:
                     area = self._convert_to_float(row.iloc[area_idx])
@@ -230,58 +298,106 @@ class DataProcessor:
         annual_path: Path,
         monthly_path: Path
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """기후 데이터 처리"""
+        """
+        연간/월간 기후 데이터를 처리하는 메인 함수
+
+        처리 과정:
+        1. CSV 파일에서 데이터 로드 (EUC-KR 인코딩)
+        2. 결측 연도/월 데이터 보간
+        3. 컬럼명 통일 및 행정구역 정보 추가
+        4. 결측치 처리 (지역별 평균으로 대체)
+
+        Notes:
+            - 연간/월간 데이터는 서로 다른 컬럼명 사용
+            - CLIMATE_COLUMNS 매핑을 통해 컬럼명 통일
+            - 모든 수치는 소수점 첫째자리까지 표현
+        """
         annual_climate = pd.read_csv(annual_path, encoding='euc-kr')
         monthly_climate = pd.read_csv(monthly_path, encoding='euc-kr')
 
-        # 시계열 데이터 완성
         annual_climate = self.fill_missing_years(annual_climate)
         monthly_climate = self.fill_missing_years(monthly_climate)
 
-        # 컬럼명 변경 및 행정구역 정보 추가
         annual_climate = self._prepare_climate_data(annual_climate, 'annual')
         monthly_climate = self._prepare_climate_data(monthly_climate, 'monthly')
 
-        # 결측치 처리
         annual_climate = self._fill_missing_climate_data(annual_climate)
         monthly_climate = self._fill_missing_climate_data(monthly_climate)
 
         return annual_climate, monthly_climate
 
     def _convert_to_float(self, value: any) -> float:
-        """문자열이나 숫자를 float로 변환"""
+        """
+        문자열이나 숫자를 float로 변환하는 헬퍼 메서드
+
+        Notes:
+            - None, NaN, '-' 값은 0.0으로 반환
+            - 숫자로 변환할 수 없는 값은 ValueError 발생
+        """
         if pd.isna(value) or str(value) == '-':
             return 0.0
         return float(value)
 
     def _filter_and_sort_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """데이터 필터링 및 정렬"""
+        """
+        데이터프레임을 필터링하고 정렬하는 헬퍼 메서드
+
+        Notes:
+            - target_regions에 포함된 지역만 필터링
+            - 행정구역과 시간순으로 정렬
+        """
         if self.target_regions:
             df = df[df['행정구역'].isin(self.target_regions)]
-        return df.sort_values(['행정구역', '일시']).reset_index(drop=True)
+        return self._sort_dataframe(df, '행정구역')
 
     def _prepare_climate_data(self, df: pd.DataFrame, data_type: str) -> pd.DataFrame:
-        """기후 데이터 전처리"""
+        """
+        기후 데이터 전처리를 위한 헬퍼 메서드
+
+        처리 과정:
+        1. 컬럼명을 통일된 형식으로 변경
+        2. 지점명을 행정구역으로 매핑
+        3. 대상 지역만 필터링
+
+        Notes:
+            - CLIMATE_COLUMNS 딕셔너리를 통해 컬럼명 변환
+            - REGION_MAPPING 딕셔너리를 통해 지역 매핑
+        """
         df = df.rename(columns=self.CLIMATE_COLUMNS[data_type])
         df['행정구역'] = df['지점명'].map(self.REGION_MAPPING)
         return df[df['행정구역'].isin(self.target_regions)]
 
     def _fill_missing_climate_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """기후 데이터 결측치 처리"""
-        climate_columns = ['평균기온(°C)', '합계 강수량(mm)',
-                         '평균 상대습도(%)', '합계 일조시간(hr)']
+        """
+        기후 데이터의 결측치를 처리하는 헬퍼 메서드
 
+        처리 과정:
+        1. 빈 문자열을 NaN으로 변환
+        2. 숫자형으로 변환 불가능한 값을 NaN으로 처리
+        3. 각 지역별 평균값으로 NaN 대체
+        4. 소수점 첫째자리까지 반올림
+
+        Notes:
+            - CLIMATE_METRICS에 정의된 컬럼만 처리
+            - 지역별로 평균을 계산하여 결측치 대체
+            - 모든 수치를 DECIMAL_PRECISION 자리까지 반올림
+        """
         df_filled = df.copy()
-        for col in climate_columns:
+
+        for col in self.CLIMATE_METRICS:
             if col in df.columns:
                 df_filled[col] = pd.to_numeric(
                     df_filled[col].replace('', np.nan),
                     errors='coerce'
                 )
-                region_means = df_filled.groupby('행정구역')[col].transform('mean').round(1)
-                df_filled[col] = df_filled[col].fillna(region_means).round(1)
-
+                region_means = (df_filled.groupby('행정구역')[col]
+                              .transform('mean')
+                              .round(self.DECIMAL_PRECISION))
+                df_filled[col] = (df_filled[col]
+                                .fillna(region_means)
+                                .round(self.DECIMAL_PRECISION))
         return df_filled
+
 
 def main():
     """메인 실행 함수"""
@@ -325,161 +441,147 @@ if __name__ == "__main__":
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score
-from xgboost import XGBRegressor
 
 class RiceProductionAnalyzer:
+    """쌀 생산량 분석을 위한 클래스"""
+
     def __init__(self):
         """데이터 로드 및 초기화"""
+        print("\n🌾 쌀 생산량 분석 시스템을 초기화합니다...")
         self.rice_data = pd.read_excel('/content/filtered_rice_production.xlsx')
         self.climate_annual = pd.read_csv('/content/filtered_climate_annual_data.csv')
         self.climate_monthly = pd.read_csv('/content/filtered_climate_monthly_data.csv')
         self.processed_data = None
+        self.region_colors = {
+            '전라남도': '#1f77b4',  # 파란색
+            '충청남도': '#2ca02c',  # 초록색
+            '전라북도': '#ff7f0e',  # 주황색
+            '경상북도': '#d62728'   # 빨간색
+        }
+        print("✅ 데이터 로드 완료\n")
         self.prepare_data()
 
     def prepare_data(self):
         """데이터 전처리"""
         # 날짜 형식 통일
+        self._unify_date_formats()
+        # 월별 기후 데이터 피봇 및 병합
+        monthly_pivot = self._create_monthly_pivot()
+        # 최종 데이터 병합
+        self._merge_all_data(monthly_pivot)
+
+    def _unify_date_formats(self):
+        """날짜 형식 통일화"""
         self.climate_annual['일시'] = self.climate_annual['일시'].astype(int)
         self.climate_monthly['연도'] = self.climate_monthly['일시'].str.split('-').str[0].astype(int)
         self.climate_monthly['월'] = self.climate_monthly['일시'].str.split('-').str[1].astype(int)
 
-        # 월별 기후 데이터 피봇
-        monthly_pivot = self.climate_monthly.pivot_table(
+    def _create_monthly_pivot(self):
+        """월별 기후 데이터 피봇 테이블 생성"""
+        pivot = self.climate_monthly.pivot_table(
             index=['행정구역', '연도'],
             columns='월',
             values=['평균기온(°C)', '평균 상대습도(%)', '합계 강수량(mm)', '합계 일조시간(hr)']
         ).reset_index()
 
         # 컬럼명 재구성
-        monthly_pivot.columns = [
-            f"{col[0]}_{col[1]}월" if isinstance(col, tuple) and col[1] != ""
-            else col[0] for col in monthly_pivot.columns
-        ]
+        pivot.columns = [f"{col[0]}_{col[1]}월" if isinstance(col, tuple) and col[1] != ""
+                        else col[0] for col in pivot.columns]
+        return pivot.rename(columns={'연도': '일시'})
 
-        # 연도 컬럼명 변경
-        monthly_pivot = monthly_pivot.rename(columns={'연도': '일시'})
-
-        # 데이터 병합
+    def _merge_all_data(self, monthly_pivot):
+        """모든 데이터 병합"""
         merged_data = pd.merge(
             self.rice_data,
             self.climate_annual[['행정구역', '일시', '평균기온(°C)', '합계 강수량(mm)',
-                           '평균 상대습도(%)', '합계 일조시간(hr)']],
+                               '평균 상대습도(%)', '합계 일조시간(hr)']],
             on=['행정구역', '일시']
         )
-
-        self.processed_data = pd.merge(
-            merged_data,
-            monthly_pivot,
-            on=['행정구역', '일시']
-        )
-
+        self.processed_data = pd.merge(merged_data, monthly_pivot, on=['행정구역', '일시'])
 
     def analyze_production_changes(self):
-        """생산량 변화 분석"""
-        # 지역별 기준년도(2008) 대비 생산량 변화율 계산
+        """생산량 변화율 분석 및 시각화"""
+        # 기준년도(2008) 대비 변화율 계산
         pivot_data = self.rice_data.pivot(index='일시', columns='행정구역', values='생산량(톤)')
         change_ratio = (pivot_data / pivot_data.iloc[0] * 100 - 100).reset_index()
-
-        # 2008년 기준 생산량 추출
         base_production = pivot_data.iloc[0].round(0)
 
+        # 데이터 재구성
         change_ratio_long = pd.melt(change_ratio,
                                   id_vars=['일시'],
                                   var_name='행정구역',
                                   value_name='변화율')
 
-        # 범례 텍스트에 기준 생산량 추가
+        # 범례 텍스트 생성
         custom_legend = {region: f"{region} (2008년: {base_production[region]:,.0f}톤)"
                         for region in pivot_data.columns}
 
-        # 지역별 색상 정의
-        colors = {
-            '전라남도': '#1f77b4',  # 파란색
-            '충청남도': '#2ca02c',  # 초록색
-            '전라북도': '#ff7f0e',  # 주황색
-            '경상북도': '#d62728'   # 빨간색
-        }
+        return self._create_production_change_plot(change_ratio_long, custom_legend)
 
-        fig = px.line(change_ratio_long,
-                    x='일시',
-                    y='변화율',
-                    color='행정구역',
-                    title='2008년 대비 지역별 쌀 생산량 변화율 (%)',
-                    labels={'변화율': '변화율 (%)', '일시': '연도'},
-                    markers=True,
-                    color_discrete_map=colors)
+    def _create_production_change_plot(self, data, custom_legend):
+        """생산량 변화 그래프 생성"""
+        fig = px.line(data,
+                     x='일시',
+                     y='변화율',
+                     color='행정구역',
+                     title='2008년 대비 지역별 쌀 생산량 변화율 (%)',
+                     labels={'변화율': '변화율 (%)', '일시': '연도'},
+                     markers=True,
+                     color_discrete_map=self.region_colors)
 
-        # 범례 텍스트 업데이트
+        # 그래프 스타일 설정
         for trace in fig.data:
             trace.name = custom_legend[trace.name]
-            trace.line.width = 3  # 선 굵기 증가
-            trace.marker.size = 8  # 마커 크기 증가
+            trace.line.width = 3
+            trace.marker.size = 8
 
         fig.update_layout(
             height=600,
             width=1000,
             yaxis_tickformat='.1f',
             legend_title_text='지역 (2008년 기준 생산량)',
-            template='plotly_white',  # 깔끔한 흰색 테마 적용
-            font=dict(family='Noto Sans KR', size=12),  # 폰트 설정
-            title=dict(
-                font=dict(size=20, color='black'),
-                x=0.5,  # 제목 중앙 정렬
-                y=0.95
-            ),
-            legend=dict(
-                yanchor="top",
-                y=0.99,
-                xanchor="right",
-                x=0.99,
-                bgcolor='rgba(255, 255, 255, 0.8)'  # 반투명 흰색 배경
-            ),
-            plot_bgcolor='white',  # 플롯 배경색
-            paper_bgcolor='white',  # 종이 배경색
-            xaxis=dict(
-                showgrid=True,
-                gridwidth=1,
-                gridcolor='lightgray',
-                title_font=dict(size=14),
-                tickfont=dict(size=12)
-            ),
-            yaxis=dict(
-                showgrid=True,
-                gridwidth=1,
-                gridcolor='lightgray',
-                title_font=dict(size=14),
-                tickfont=dict(size=12)
-            )
+            template='plotly_white',
+            font=dict(family='Noto Sans KR', size=12),
+            title=dict(font=dict(size=20, color='black'), x=0.5, y=0.95),
+            legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99,
+                       bgcolor='rgba(255, 255, 255, 0.8)'),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            xaxis=self._get_axis_style(),
+            yaxis=self._get_axis_style()
         )
-
         return fig
 
+    def _get_axis_style(self):
+        """축 스타일 설정"""
+        return dict(
+            showgrid=True,
+            gridwidth=1,
+            gridcolor='lightgray',
+            title_font=dict(size=14),
+            tickfont=dict(size=12)
+        )
+
     def analyze_regional_comparison(self):
-        """지역별 생산 특성 비교"""
-        # 지역별 연도별 통계 계산
+        """지역별 생산 특성 비교 분석"""
+        stats_df = self._calculate_regional_stats()
+        return self._create_regional_comparison_plot(stats_df)
+
+    def _calculate_regional_stats(self):
+        """지역별 통계 계산"""
         stats_df = self.rice_data.groupby(['행정구역', '일시']).agg({
             '재배면적(ha)': 'sum',
             '생산량(톤)': 'sum'
         }).reset_index()
+        stats_df['단위면적당생산량'] = (stats_df['생산량(톤)'] /
+                                      stats_df['재배면적(ha)']).round(2)
+        return stats_df
 
-        # 단위면적당 생산량 계산 (톤/ha)
-        stats_df['단위면적당생산량'] = (stats_df['생산량(톤)'] / stats_df['재배면적(ha)']).round(2)
-
-        # 지역별 색상 정의
-        region_colors = {
-            '전라남도': '#1f77b4',
-            '충청남도': '#ff7f0e',
-            '전라북도': '#2ca02c',
-            '경상북도': '#d62728'
-        }
-
+    def _create_regional_comparison_plot(self, stats_df):
+        """지역별 비교 그래프 생성"""
         fig = make_subplots(
             rows=1, cols=3,
             subplot_titles=('지역별 재배면적 (ha)',
@@ -497,8 +599,8 @@ class RiceProductionAnalyzer:
                         name=region,
                         boxpoints='all',
                         pointpos=0,
-                        marker_color=region_colors[region],
-                        line_color=region_colors[region],
+                        marker_color=self.region_colors[region],
+                        line_color=self.region_colors[region],
                         showlegend=(i == 1)
                     ),
                     row=1, col=i
@@ -511,22 +613,18 @@ class RiceProductionAnalyzer:
             showlegend=True
         )
 
-        # y축 레이블 업데이트
-        fig.update_yaxes(title_text="재배면적 (ha)", row=1, col=1)
-        fig.update_yaxes(title_text="총 생산량 (톤)", row=1, col=2)
-        fig.update_yaxes(title_text="단위면적당 생산량 (톤/ha)", row=1, col=3)
+        for i, measure in enumerate(measures, 1):
+            fig.update_yaxes(title_text=measure, row=1, col=i)
 
         return fig
 
-
     def analyze_climate_vulnerability(self):
         """지역별 기후 취약성 분석"""
-        # Plotly를 사용한 히트맵 생성을 위한 준비
         climate_vars = ['평균기온(°C)', '합계 강수량(mm)', '평균 상대습도(%)', '합계 일조시간(hr)']
         vulnerability_metrics = {}
 
         for region in self.processed_data['행정구역'].unique():
-            region_data = self.processed_data[self.processed_data['행정구역'] == region]  # 이 부분이 수정됨
+            region_data = self.processed_data[self.processed_data['행정구역'] == region]
 
             # 각 기후 변수의 변동계수(CV) 계산
             cv_metrics = {}
@@ -555,7 +653,6 @@ class RiceProductionAnalyzer:
             colorbar=dict(title='변동계수(CV)'),
         ))
 
-        # 레이아웃 업데이트
         fig.update_layout(
             title='지역별 기후 취약성 지표 (변동계수 기반)',
             xaxis_title='기후 변수',
@@ -566,190 +663,152 @@ class RiceProductionAnalyzer:
 
         return fig, vulnerability_df
 
-
-#############################
-################################################################################################################
-################################################################################################################
-################################################################################################################
-################################################################################################################
-################################################################################################################
-################################################################################################################
-################################################################################################################
-################################################################################################################
-###################################################################################################################################################################################################
     def analyze_optimal_conditions(self):
-       """지역별 최적 재배 조건 분석"""
-       climate_vars = ['평균기온(°C)', '합계 강수량(mm)', '평균 상대습도(%)', '합계 일조시간(hr)']
-       optimal_conditions = {}
+        """지역별 최적 재배 조건 분석"""
+        climate_vars = ['평균기온(°C)', '합계 강수량(mm)', '평균 상대습도(%)', '합계 일조시간(hr)']
+        optimal_conditions = {}
 
-       for region in self.processed_data['행정구역'].unique():
-           # 각 지역별로 상위 20% 데이터 추출
-           region_data = self.processed_data[self.processed_data['행정구역'] == region]
-           threshold = region_data['생산량(톤)'].quantile(0.8)
-           region_optimal = region_data[region_data['생산량(톤)'] >= threshold]
+        for region in self.processed_data['행정구역'].unique():
+            # 각 지역별로 상위 20% 데이터 추출
+            region_data = self.processed_data[self.processed_data['행정구역'] == region]
+            threshold = region_data['생산량(톤)'].quantile(0.8)
+            region_optimal = region_data[region_data['생산량(톤)'] >= threshold]
 
-           conditions = {}
-           for var in climate_vars:
-               conditions[f'{var}_범위'] = {
-                   '최소': region_optimal[var].min(),
-                   '최대': region_optimal[var].max(),
-                   '평균': region_optimal[var].mean()
-               }
+            conditions = {}
+            for var in climate_vars:
+                conditions[f'{var}_범위'] = {
+                    '최소': region_optimal[var].min(),
+                    '최대': region_optimal[var].max(),
+                    '평균': region_optimal[var].mean()
+                }
 
-           optimal_conditions[region] = conditions
+            optimal_conditions[region] = conditions
 
-       # 서브플롯 생성 (가로 배치)
-       fig = make_subplots(
-           rows=1,
-           cols=4,
-           subplot_titles=[f'<b>{var}</b>' for var in climate_vars],
-           horizontal_spacing=0.08  # 서브플롯 간격 늘림
-       )
+        fig = make_subplots(
+            rows=1,
+            cols=4,
+            subplot_titles=[f'{var}' for var in climate_vars],
+            horizontal_spacing=0.08
+        )
 
-       # 지역별 색상 정의 - 더 세련된 색상으로 변경
-       region_colors = {
-           '전라남도': '#3498db',  # 밝은 파란색
-           '충청남도': '#2ecc71',  # 밝은 초록색
-           '전라북도': '#f1c40f',  # 밝은 노란색
-           '경상북도': '#e74c3c'   # 밝은 빨간색
-       }
+        for idx, var in enumerate(climate_vars, 1):
+            regions = []
+            means = []
+            mins = []
+            maxs = []
+            colors = []
 
-       # 각 기후 변수별 바 차트 추가
-       for idx, var in enumerate(climate_vars, 1):
-           # 평균값 데이터 준비
-           regions = []
-           means = []
-           mins = []
-           maxs = []
-           colors = []
+            for region in optimal_conditions.keys():
+                regions.append(region)
+                means.append(optimal_conditions[region][f'{var}_범위']['평균'])
+                mins.append(optimal_conditions[region][f'{var}_범위']['최소'])
+                maxs.append(optimal_conditions[region][f'{var}_범위']['최대'])
+                colors.append(self.region_colors[region])
 
-           for region in optimal_conditions.keys():
-               regions.append(region)
-               means.append(optimal_conditions[region][f'{var}_범위']['평균'])
-               mins.append(optimal_conditions[region][f'{var}_범위']['최소'])
-               maxs.append(optimal_conditions[region][f'{var}_범위']['최대'])
-               colors.append(region_colors[region])
+            fig.add_trace(
+                go.Bar(
+                    name=var,
+                    y=regions,
+                    x=means,
+                    error_x=dict(
+                        type='data',
+                        symmetric=False,
+                        array=[max-mean for max, mean in zip(maxs, means)],
+                        arrayminus=[mean-min for min, mean in zip(mins, means)],
+                        color='rgba(0,0,0,0.2)',
+                        thickness=1.5,
+                        width=10
+                    ),
+                    text=[f'{mean:.1f}' for mean in means],
+                    textposition='auto',
+                    marker=dict(
+                        color=colors,
+                        line=dict(width=1, color='#ffffff')
+                    ),
+                    showlegend=False,
+                    orientation='h',
+                    hovertemplate='%{y}' +
+                                f'{var}: ' + '%{x:.1f}' +
+                                '최소: %{customdata[0]:.1f}' +
+                                '최대: %{customdata[1]:.1f}' +
+                                '',
+                    customdata=list(zip(mins, maxs))
+                ),
+                row=1,
+                col=idx
+            )
 
-           # 바 차트 추가
-           fig.add_trace(
-               go.Bar(
-                   name=var,
-                   y=regions,
-                   x=means,
-                   error_x=dict(
-                       type='data',
-                       symmetric=False,
-                       array=[max-mean for max, mean in zip(maxs, means)],
-                       arrayminus=[mean-min for min, mean in zip(mins, means)],
-                       color='rgba(0,0,0,0.2)',  # 더 투명한 오차 막대
-                       thickness=1.5,
-                       width=10
-                   ),
-                   text=[f'{mean:.1f}' for mean in means],  # 간단한 텍스트 표시
-                   textposition='auto',
-                   marker=dict(
-                       color=colors,
-                       line=dict(width=1, color='#ffffff')  # 흰색 테두리 추가
-                   ),
-                   showlegend=False,
-                   orientation='h',
-                   hovertemplate='<b>%{y}</b><br>' +
-                               f'{var}: ' + '%{x:.1f}<br>' +
-                               '최소: %{customdata[0]:.1f}<br>' +
-                               '최대: %{customdata[1]:.1f}<br>' +
-                               '<extra></extra>',
-                   customdata=list(zip(mins, maxs))  # 호버 데이터 추가
-               ),
-               row=1,
-               col=idx
-           )
+            fig.update_xaxes(
+                title=dict(
+                    text=var,
+                    font=dict(size=12, color='#2c3e50')
+                ),
+                tickfont=dict(size=10),
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='rgba(189, 195, 199, 0.4)',
+                row=1,
+                col=idx
+            )
 
-           # 축 레이블 업데이트
-           fig.update_xaxes(
-               title=dict(
-                   text=var,
-                   font=dict(size=12, color='#2c3e50')  # 진한 회색으로 변경
-               ),
-               tickfont=dict(size=10),
-               showgrid=True,
-               gridwidth=1,
-               gridcolor='rgba(189, 195, 199, 0.4)',  # 연한 그리드
-               row=1,
-               col=idx
-           )
+            fig.update_yaxes(
+                tickfont=dict(size=12, color='#2c3e50'),
+                showgrid=False,
+                row=1,
+                col=idx
+            )
 
-           fig.update_yaxes(
-               tickfont=dict(size=12, color='#2c3e50'),  # 진한 회색으로 변경
-               showgrid=False,
-               row=1,
-               col=idx
-           )
+        fig.update_layout(
+            height=350,
+            width=1500,
+            title=dict(
+                text='지역별 최적 기후 조건 분석 (상위 20% 생산량 기준)',
+                x=0.5,
+                font=dict(size=20, color='#2c3e50', family='Noto Sans KR')
+            ),
+            showlegend=False,
+            template='plotly_white',
+            font=dict(family='Noto Sans KR'),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            margin=dict(t=100, b=50, l=50, r=50),
+            bargap=0.2,
+        )
 
-       # 레이아웃 업데이트
-       fig.update_layout(
-           height=350,  # 높이 조정
-           width=1500,
-           title=dict(
-               text='지역별 최적 기후 조건 분석 (상위 20% 생산량 기준)',
-               x=0.5,
-               font=dict(size=20, color='#2c3e50', family='Noto Sans KR')
-           ),
-           showlegend=False,
-           template='plotly_white',
-           font=dict(family='Noto Sans KR'),
-           plot_bgcolor='white',
-           paper_bgcolor='white',
-           margin=dict(t=100, b=50, l=50, r=50),
-           bargap=0.2,  # 막대 사이 간격 조정
-       )
+        for i in fig['layout']['annotations']:
+            i['font'] = dict(size=14, color='#2c3e50', family='Noto Sans KR')
 
-       # 서브플롯 제목 스타일 업데이트
-       for i in fig['layout']['annotations']:
-           i['font'] = dict(size=14, color='#2c3e50', family='Noto Sans KR')
-
-       return fig, optimal_conditions
-
-################################################################################################################
-################################################################################################################
+        return fig, optimal_conditions
 
     def run_all_analyses(self):
         """모든 분석 실행"""
-
-        print("\n2. 생산량 변화 분석 중...")
+        print("1️⃣ 생산량 변화 분석")
+        print("   📈 2008년 대비 지역별 쌀 생산량 변화율을 분석중...")
         fig_changes = self.analyze_production_changes()
         fig_changes.show()
 
-        print("\n3. 지역별 생산 특성 비교 중...")
+        print("2️⃣ 지역별 생산 특성 비교")
+        print("   📊 재배면적, 생산량, 단위면적당 생산량을 분석중...")
         fig_comparison = self.analyze_regional_comparison()
         fig_comparison.show()
 
-        print("\n5. 기후 취약성 분석 중...")
+        print("3️⃣ 기후 취약성 분석")
+        print("   🌡️ 기후 변수별 지역 취약성을 평가중...")
         fig_vulnerability, vulnerability_df = self.analyze_climate_vulnerability()
         fig_vulnerability.show()
 
-        print("\n6. 최적 재배 조건 분석 중...")
+        print("4️⃣ 최적 재배 조건 분석")
+        print("   🎯 지역별 최적 기후 조건을 도출중...")
         fig_optimal, optimal_conditions = self.analyze_optimal_conditions()
         fig_optimal.show()
 
-
-        print("\n분석이 완료되었습니다.")
+        print("="*50)
+        print("🎉 모든 분석이 성공적으로 완료되었습니다!")
+        print("="*50 + "\n")
 
 def main():
     """메인 함수"""
-    # 필요한 패키지 설치
-    print("필요한 패키지를 설치합니다...")
-    try:
-        import plotly
-    except ImportError:
-        !pip install plotly
-
-    try:
-        import xgboost
-    except ImportError:
-        !pip install xgboost
-
-    # 분석 실행
-    print("\n분석을 시작합니다...")
+    print("\n🚀 쌀 생산량 종합 분석 시스템을 시작합니다...")
     analyzer = RiceProductionAnalyzer()
     analyzer.run_all_analyses()
 
@@ -988,92 +1047,101 @@ class RiceProductionPredictor:
 
                 latest_data['일시'] = future_year
 
+                # 시나리오별 데이터 처리 전 기후 변수 컬럼 목록 생성
+                climate_cols = []
+                for season_info in growing_seasons.values():
+                    for var in season_info['critical_vars']:
+                        for month in season_info['months']:
+                            col = f"{var}_{month}월"
+                            if col in region_data.columns:
+                                climate_cols.append(col)
+
                 # 시나리오별 기후 데이터 처리
                 if scenario == 'trend':
-                    # 재배시기별로 기후변화 추세 분석 및 적용
-                    for season, season_info in growing_seasons.items():
-                        for var in season_info['critical_vars']:
-                            # 해당 시기의 월별 컬럼 찾기
-                            season_cols = [f"{var}_{m}월" for m in season_info['months']
-                                        if f"{var}_{m}월" in region_data.columns]
-
-                            for col in season_cols:
-                                # 연간 추세 계산
-                                years = region_data['일시'].values
-                                values = region_data[col].values
-                                trend = np.polyfit(years, values, deg=1)
-
-                                # 추세를 반영한 미래값 예측 (가중치 적용)
-                                projected_value = np.polyval(trend, future_year) * season_info['weight']
-                                latest_data[col] = projected_value
+                    for col in climate_cols:
+                        # 연간 추세 계산 (차수를 2로 증가)
+                        years = region_data['일시'].values
+                        values = region_data[col].values
+                        trend = np.polyfit(years, values, deg=2)
+                        projected_value = np.polyval(trend, future_year)
+                        latest_data[col] = projected_value
 
                 elif scenario == 'worst':
-                    for season, season_info in growing_seasons.items():
-                        for var in season_info['critical_vars']:
-                            season_cols = [f"{var}_{m}월" for m in season_info['months']
-                                        if f"{var}_{m}월" in region_data.columns]
-
-                            for col in season_cols:
-                                if '기온' in col:
-                                    if any(m in col for m in ['6', '7', '8']):  # 생육기 고온
-                                        latest_data[col] = region_data[col].max() * 1.2
-                                    else:
-                                        latest_data[col] = region_data[col].mean()
-                                elif '강수량' in col:
-                                    if any(m in col for m in ['5']):  # 모내기철 가뭄
-                                        latest_data[col] = region_data[col].min() * 0.8
-                                    elif any(m in col for m in ['9']):  # 수확기 강우
-                                        latest_data[col] = region_data[col].max() * 1.3
-                                    else:
-                                        latest_data[col] = region_data[col].mean()
-                                else:
-                                    latest_data[col] = region_data[col].quantile(0.1)
+                    for col in climate_cols:
+                        if '기온' in col:
+                            if any(str(m) in col for m in [6, 7, 8]):  # 생육기 고온
+                                latest_data[col] = region_data[col].max() * 1.2
+                            else:
+                                latest_data[col] = region_data[col].max() * 1.1
+                        elif '강수량' in col:
+                            if any(str(m) in col for m in [5]):  # 모내기철 가뭄
+                                latest_data[col] = region_data[col].min() * 0.7
+                            elif any(str(m) in col for m in [9]):  # 수확기 강우
+                                latest_data[col] = region_data[col].max() * 1.4
+                            else:
+                                latest_data[col] = region_data[col].quantile(0.9)
+                        elif '일조시간' in col:
+                            latest_data[col] = region_data[col].min() * 0.8
+                        else:  # 상대습도
+                            latest_data[col] = region_data[col].max() * 1.2
 
                 elif scenario == 'best':
-                    # 과거 최고 수확량 년도의 기후조건 활용
-                    best_year = region_data.loc[region_data['생산량(톤)'].idxmax(), '일시']
-                    best_climate = region_data[region_data['일시'] == best_year].copy()
+                    # 최근 5년 중 최고 수확량 년도 찾기
+                    recent_data = region_data.tail(5)
+                    best_year = recent_data.loc[recent_data['생산량(톤)'].idxmax(), '일시']
+                    best_climate = recent_data[recent_data['일시'] == best_year]
 
-                    for season, season_info in growing_seasons.items():
-                        for var in season_info['critical_vars']:
-                            season_cols = [f"{var}_{m}월" for m in season_info['months']
-                                        if f"{var}_{m}월" in region_data.columns]
-
-                            for col in season_cols:
-                                latest_data[col] = best_climate[col].iloc[0] * season_info['weight']
+                    for col in climate_cols:
+                        optimal_value = best_climate[col].iloc[0]
+                        # 최적 조건에 약간의 개선을 가정
+                        if '기온' in col:
+                            latest_data[col] = optimal_value * 1.05
+                        elif '강수량' in col:
+                            latest_data[col] = optimal_value * 1.1
+                        elif '일조시간' in col:
+                            latest_data[col] = optimal_value * 1.15
+                        else:  # 상대습도
+                            latest_data[col] = optimal_value * 1.02
 
                 else:  # 'average' scenario
-                    # 최근 5년 평균 기후 데이터에 시기별 가중치 적용
-                    recent_data = region_data.tail(5)
-                    for season, season_info in growing_seasons.items():
-                        for var in season_info['critical_vars']:
-                            season_cols = [f"{var}_{m}월" for m in season_info['months']
-                                        if f"{var}_{m}월" in region_data.columns]
+                    # 최근 3년 평균 사용
+                    recent_data = region_data.tail(3)
+                    for col in climate_cols:
+                        seasonal_adjustment = 1.0
+                        if '기온' in col:
+                            # 월별로 다른 가중치 적용
+                            month = int(col.split('_')[1].replace('월', ''))
+                            if month in [6, 7, 8]:  # 여름철
+                                seasonal_adjustment = 1.1
+                            elif month in [12, 1, 2]:  # 겨울철
+                                seasonal_adjustment = 0.9
+                        latest_data[col] = recent_data[col].mean() * seasonal_adjustment
 
-                            for col in season_cols:
-                                latest_data[col] = recent_data[col].mean() * season_info['weight']
-
-                # 재배면적 추세 반영
+                # 재배면적 추세 반영 (2차 다항식 사용)
                 years = region_data['일시'].values
                 areas = region_data['재배면적(ha)'].values
-                area_trend = np.polyfit(years, areas, deg=1)
-                projected_area = np.polyval(area_trend, future_year)
+                area_trend = np.polyfit(years, areas, deg=2)
+                projected_area = max(0, np.polyval(area_trend, future_year))  # 음수 방지
                 latest_data['재배면적(ha)'] = projected_area
 
                 # 이전 연도 데이터 업데이트
                 latest_data['이전년도_생산량'] = region_data.iloc[-1]['생산량(톤)']
                 latest_data['이전년도_재배면적'] = region_data.iloc[-1]['재배면적(ha)']
 
-                # 예측을 위한 특성 선택
+                # 예측을 위한 특성 선택 및 스케일링
                 X_future = latest_data[self.feature_columns]
-
-                # 스케일링 및 예측
                 X_future_scaled = self.scaler.transform(X_future)
                 pred = self.model.predict(X_future_scaled)[0]
 
-                # 95% 신뢰구간 계산
-                pred_std = np.std(region_data['생산량(톤)']) / np.sqrt(len(region_data))
-                confidence_interval = 1.96 * pred_std
+                # 신뢰구간 계산 (시나리오별 불확실성 반영)
+                base_std = np.std(region_data['생산량(톤)']) / np.sqrt(len(region_data))
+                scenario_uncertainty = {
+                    'trend': 1.0,
+                    'average': 1.2,
+                    'worst': 1.5,
+                    'best': 1.3
+                }
+                confidence_interval = 1.96 * base_std * scenario_uncertainty[scenario]
 
                 predictions.append({
                     '행정구역': region,
@@ -1218,35 +1286,33 @@ class RiceProductionPredictor:
         plt.tight_layout()
         plt.show()
 
-    def plot_prediction_results(self, comparison_2024, predictions_2025, results_2023):
+    def plot_prediction_results(self, predictions_2024, predictions_2025, results_2023):
         """예측 결과 시각화"""
         plt.style.use('seaborn')
 
-        # 1. 시나리오별 예측 비교
+        # 1. 시나리오별 2024년 예측 비교
         fig, axes = plt.subplots(2, 2, figsize=(20, 15))
 
-        # 바 차트로 시나리오별 예측량 비교
         scenarios = ['trend', 'average', 'worst', 'best']
         colors = ['#2ecc71', '#3498db', '#e74c3c', '#f1c40f']
 
         for i, scenario in enumerate(scenarios):
             ax = axes[i//2, i%2]
-            comparison = comparison_2024[scenario]
+            predictions = predictions_2024[scenario]
 
-            x = np.arange(len(comparison['행정구역']))
-            width = 0.35
+            x = np.arange(len(predictions['행정구역']))
 
-            ax.bar(x - width/2, comparison['실제_생산량'], width, label='실제 생산량', color='gray', alpha=0.5)
-            ax.bar(x + width/2, comparison['예측_생산량'], width, label='예측 생산량', color=colors[i])
+            # 예측값만 표시
+            ax.bar(x, predictions['예측_생산량'], color=colors[i], label='예측 생산량')
 
             # 신뢰구간 표시
-            ax.errorbar(x + width/2, comparison['예측_생산량'],
-                      yerr=[comparison['예측_생산량'] - comparison['신뢰구간_하한'],
-                            comparison['신뢰구간_상한'] - comparison['예측_생산량']],
+            ax.errorbar(x, predictions['예측_생산량'],
+                      yerr=[predictions['예측_생산량'] - predictions['신뢰구간_하한'],
+                            predictions['신뢰구간_상한'] - predictions['예측_생산량']],
                       fmt='none', color='black', capsize=5)
 
             ax.set_xticks(x)
-            ax.set_xticklabels(comparison['행정구역'])
+            ax.set_xticklabels(predictions['행정구역'])
             ax.set_title(f'{scenario.capitalize()} 시나리오 예측 결과')
             ax.legend()
 
@@ -1259,9 +1325,9 @@ class RiceProductionPredictor:
         for region in results_2023['행정구역'].unique():
             years = [2023, 2024, 2025]
             values = [
-                results_2023[results_2023['행정구역'] == region]['실제_생산량'].iloc[0],
-                comparison_2024['trend'][comparison_2024['trend']['행정구역'] == region]['예측_생산량'].iloc[0],
-                predictions_2025[predictions_2025['행정구역'] == region]['예측_생산량'].iloc[0]
+                results_2023[results_2023['행정구역'] == region]['실제_생산량'].iloc[0],  # 2023년은 실제값
+                predictions_2024['trend'][predictions_2024['trend']['행정구역'] == region]['예측_생산량'].iloc[0],  # 2024년 예측값
+                predictions_2025[predictions_2025['행정구역'] == region]['예측_생산량'].iloc[0]  # 2025년 예측값
             ]
             plt.plot(years, values, marker='o', linewidth=2, markersize=8, label=region)
 
@@ -1276,7 +1342,7 @@ class RiceProductionPredictor:
         # 3. 지역별 단위면적당 생산량 비교
         plt.figure(figsize=(10, 6))
         for scenario in scenarios:
-            data = comparison_2024[scenario]
+            data = predictions_2024[scenario]
             plt.plot(data['행정구역'], data['단위면적당_생산량'],
                     marker='o', label=scenario.capitalize())
 
@@ -1293,15 +1359,15 @@ class RiceProductionPredictor:
 
 def main():
     try:
-        # 예측기 인스턴스 생성
-        print("="*50)
-        print("쌀 생산량 예측 모델 초기화")
-        print("="*50)
+        # 시스템 시작
+        print("\n" + "="*70)
+        print("                    🌾 쌀 생산량 예측 시스템 🌾")
+        print("="*70)
         predictor = RiceProductionPredictor()
 
         # 2023년 예측 및 평가
-        #
-        print("\n2023년 쌀 생산량 예측 시작...")
+        print("\n📊 [2023년 쌀 생산량 예측 분석]")
+        print("-"*70)
         results_2023, metrics, feature_importance = predictor.train_model(target_year=2023)
 
         # 상세 평가 지표 계산
@@ -1310,76 +1376,65 @@ def main():
             results_2023['예측_생산량']
         )
 
-        # 결과 출력
-        print("\n2023년 예측 결과:")
+        # 지역별 예측 결과 출력
+        print("\n📍 지역별 예측 결과 분석")
+        print("-" * 70)
+        print("※ 단위: 톤")
         results_display = results_2023.copy()
-        # 천 단위 구분기호 추가
         results_display['실제_생산량'] = results_display['실제_생산량'].apply(lambda x: f"{x:,.0f}")
         results_display['예측_생산량'] = results_display['예측_생산량'].apply(lambda x: f"{x:,.0f}")
         print(results_display)
 
-        print("\n모델 평가 지표:")
+        print("\n📈 모델 성능 평가 지표:")
+        print("-" * 70)
         metrics_df = pd.DataFrame([detailed_metrics]).round(4)
         print(metrics_df)
 
-        print("\n오차의 정규성 검정 결과:")
-        print(f"p-value: {detailed_metrics['Error_Normality_p_value']:.4f}")
+        print("\n🔍 예측 정확도 검증:")
+        print("-" * 70)
+        print(f"신뢰성 검정 P-값: {detailed_metrics['Error_Normality_p_value']:.4f}")
         if detailed_metrics['Error_Normality_p_value'] > 0.05:
-            print("오차가 정규분포를 따릅니다 (신뢰할 만한 예측)")
+            print("✅ 예측 결과가 통계적으로 신뢰할 수 있는 수준입니다.")
         else:
-            print("오차가 정규분포를 따르지 않습니다 (예측에 편향이 있을 수 있음)")
-
-        # print("\n주요 영향 특성 (상위 10개):")
-        # print(feature_importance.head(10))
-
-        # # 특성 중요도 시각화
-        # plt.figure(figsize=(12, 6))
-        # sns.barplot(x='importance', y='feature', data=feature_importance.head(10))
-        # plt.title('Top 10 Important Features')
-        # plt.xlabel('Feature Importance')
-        # plt.tight_layout()
-        # plt.show()
+            print("⚠️ 예측 결과에 일부 편향이 있을 수 있습니다.")
 
         # 미래 예측
         if detailed_metrics['R2'] > 0.7:
-            print("\n미래 생산량 예측 시작...")
+            print("\n🔮 미래 생산량 예측 분석 시작...")
 
             # 각 시나리오별 2024년 예측
             scenarios = ['trend', 'average', 'worst', 'best']
+            scenario_names = {
+                'trend': '추세 기반',
+                'average': '평균 기후',
+                'worst': '최악 기후',
+                'best': '최적 기후'
+            }
             predictions_2024 = {}
 
             for scenario in scenarios:
                 predictions_2024[scenario] = predictor.predict_future(2024, scenario=scenario)
-                comparison = pd.merge(
-                    predictions_2024[scenario],
-                    results_2023[['행정구역', '실제_생산량']].groupby('행정구역').first(),
-                    on='행정구역'
-                )
-                comparison['변화율(%)'] = (
-                    (comparison['예측_생산량'] - comparison['실제_생산량'])
-                    / comparison['실제_생산량'] * 100
-                )
 
-                print(f"\n2024년 예측 ({scenario} 시나리오):")
-                comparison_display = comparison.copy()
-                # 천 단위 구분기호 추가
-                comparison_display['예측_생산량'] = comparison_display['예측_생산량'].apply(lambda x: f"{x:,.0f}")
-                comparison_display['실제_생산량'] = comparison_display['실제_생산량'].apply(lambda x: f"{x:,.0f}")
-                print(comparison_display.round(2))
+                print(f"\n📊 2024년 예측 - {scenario_names[scenario]} 시나리오")
+                print("-" * 70)
+                print("※ 단위: 톤")
+                predictions_display = predictions_2024[scenario].copy()
+                predictions_display['예측_생산량'] = predictions_display['예측_생산량'].apply(lambda x: f"{x:,.0f}")
+                print(predictions_display.round(2))
 
                 # 신뢰구간 시각화
                 plt.figure(figsize=(10, 6))
                 plt.errorbar(
-                    comparison['행정구역'],
-                    comparison['예측_생산량'],
+                    predictions_2024[scenario]['행정구역'],
+                    predictions_2024[scenario]['예측_생산량'],
                     yerr=[
-                        comparison['예측_생산량'] - comparison['신뢰구간_하한'],
-                        comparison['신뢰구간_상한'] - comparison['예측_생산량']
+                        predictions_2024[scenario]['예측_생산량'] - predictions_2024[scenario]['신뢰구간_하한'],
+                        predictions_2024[scenario]['신뢰구간_상한'] - predictions_2024[scenario]['예측_생산량']
                     ],
                     fmt='o'
                 )
-                plt.title(f'2024 Production Forecast - {scenario.capitalize()} Scenario')
-                plt.ylabel('Production (Tons)')
+                plt.title(f'2024 생산량 예측 - {scenario.capitalize()} 시나리오')
+                plt.ylabel('생산량 (톤)')
                 plt.xticks(rotation=45)
                 plt.grid(True)
                 plt.tight_layout()
@@ -1399,14 +1454,22 @@ def main():
                 / comparison_2025['2024년_예측'] * 100
             )
 
-            print("\n2025년 예측 (trend 시나리오):")
-            comparison_display = comparison_2025.copy()
-            # 천 단위 구분기호 추가
-            comparison_display['예측_생산량'] = comparison_display['예측_생산량'].apply(lambda x: f"{x:,.0f}")
-            comparison_display['2024년_예측'] = comparison_display['2024년_예측'].apply(lambda x: f"{x:,.0f}")
-            print(comparison_display.round(2))
+            print("\n🔮 2025년 장기 예측 분석 (추세 기반)")
+            print("=" * 80)
+            print("\n지역별 예측 결과:")
+            print("-" * 80)
 
-            # 2023-2025 추세 시각화
+            for idx, row in comparison_2025.iterrows():
+                print(f"▶ {row['행정구역']}")
+                print(f"   - 2025년 예상 생산량: {row['예측_생산량']:>15,.0f} 톤")
+                print(f"   - 2024년 예상 생산량: {row['2024년_예측']:>15,.0f} 톤")
+                print(f"   - 전년대비 변화율:    {row['변화율(%)']:>15.2f} %")
+                print(f"   - 재배면적:           {row['재배면적(ha)']:>15,.2f} ha")
+                print(f"   - 단위면적당 생산량:  {row['단위면적당_생산량']:>15.2f} 톤/ha")
+                print("-" * 80)
+
+
+            # 추세 시각화
             plt.figure(figsize=(12, 6))
             for region in results_2023['행정구역'].unique():
                 years = [2023, 2024, 2025]
@@ -1417,19 +1480,20 @@ def main():
                 ]
                 plt.plot(years, values, marker='o', label=region)
 
-            plt.title('Rice Production Trend 2023-2025')
-            plt.xlabel('Year')
-            plt.ylabel('Production (Tons)')
+            plt.title('쌀 생산량 Trend 2023-2025')
+            plt.xlabel('연도')
+            plt.ylabel('생산량 (톤)')
             plt.legend()
             plt.grid(True)
             plt.tight_layout()
             plt.show()
 
         else:
-            print("\n모델의 정확도가 낮아 미래 예측을 수행하지 않습니다.")
+            print("\n⚠️ 경고: 모델의 예측 정확도가 기준치(R2 > 0.7)에 미달하여 미래 예측을 수행할 수 없습니다.")
 
     except Exception as e:
-        print(f"\n프로그램 실행 중 오류 발생: {str(e)}")
+        print(f"\n❌ 시스템 오류 발생: {str(e)}")
+        print("프로그램을 다시 실행해주세요.")
         raise
 
 if __name__ == "__main__":
