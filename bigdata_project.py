@@ -7,8 +7,7 @@ Original file is located at
     https://colab.research.google.com/drive/1wzA69UpyRVHiiRxgoF9hNWdYD1nTiw88
 
 **기후 변화에 따른 쌀 생산량 분석 및 예측**<br>
-(3-A)202244035<br>
-이승예
+202244035(3-A)<br>이승예
 """
 
 # 단계 1: 폰트 설치
